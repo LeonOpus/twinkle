@@ -9,12 +9,12 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle_agentic.tools.tool_manager import ToolManager
-
 from .data_plane import TransferQueueDataPlane
 from .registry import AdapterRegistry
 from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
 from .staleness import StalenessManager
-from .types import PartitionMetadata, PartitionStatus, RolloutContextState, SampleRecord, TrainingContext
+from .types import (PartialRolloutConfig, PartitionMetadata, PartitionStatus, RolloutContextState, RolloutGroupRequest,
+                    RolloutGroupResult, SampleRecord, TrainingContext)
 
 
 class ToolManagerFactory:
@@ -24,7 +24,7 @@ class ToolManagerFactory:
     without importing untrusted user code in the server process.
     """
 
-    def __init__(self, profiles: Optional[Dict[str, Callable[[TrainingContext, SampleRecord], ToolManager]]] = None):
+    def __init__(self, profiles: dict[str, Callable[[TrainingContext, SampleRecord], ToolManager]] | None = None):
         self._profiles = dict(profiles or {})
 
     def register(self, profile: str, factory: Callable[[TrainingContext, SampleRecord], ToolManager]) -> None:
@@ -47,8 +47,9 @@ class AsyncRollouter:
         adapter_registry: AdapterRegistry,
         staleness_manager: StalenessManager,
         rollout,
-        tool_manager_factory: Optional[ToolManagerFactory] = None,
-        rollout_policy: Optional[Any] = None,
+        tool_manager_factory: ToolManagerFactory | None = None,
+        rollout_policy: Any | None = None,
+        partial_rollout_config: PartialRolloutConfig | None = None,
         max_concurrent_groups: int = 16,
         target_groups_per_partition: int = 1,
     ):
@@ -58,22 +59,23 @@ class AsyncRollouter:
         self.rollout = rollout
         self.tool_manager_factory = tool_manager_factory or ToolManagerFactory()
         self.rollout_policy = rollout_policy or WorkConservingRolloutPolicy()
+        self.partial_rollout_config = partial_rollout_config or PartialRolloutConfig()
         self.max_concurrent_groups = max_concurrent_groups
         self.target_groups_per_partition = target_groups_per_partition
-        self.pending_by_context: Dict[str, Deque[tuple[TrainingContext, SampleRecord]]] = defaultdict(deque)
+        self.pending_by_context: dict[str, Deque[RolloutGroupRequest]] = defaultdict(deque)
         self.active_tasks: set[asyncio.Task] = set()
-        self.transfer_buffer_by_context: Dict[str, List[Trajectory]] = defaultdict(list)
-        self._last_submit_time: Dict[str, float] = defaultdict(float)
-        self._submitted_groups: Dict[str, int] = defaultdict(int)
+        self.transfer_buffer_by_context: dict[str, list[Trajectory]] = defaultdict(list)
+        self._last_submit_time: dict[str, float] = defaultdict(float)
+        self._submitted_groups: dict[str, int] = defaultdict(int)
 
     def add_pending(self, context: TrainingContext, samples: Iterable[SampleRecord]) -> None:
         self.adapter_registry.register(context)
         self.data_plane.init_namespace(context)
         queue = self.pending_by_context[context.key]
         for sample in samples:
-            queue.append((context, sample))
+            queue.append(RolloutGroupRequest(context=context, sample=sample))
 
-    def _state_for(self, context: TrainingContext) -> Optional[RolloutContextState]:
+    def _state_for(self, context: TrainingContext) -> RolloutContextState | None:
         pending_groups = len(self.pending_by_context.get(context.key, ()))
         if pending_groups <= 0:
             return None
@@ -95,14 +97,14 @@ class AsyncRollouter:
             weight=record.weight,
         )
 
-    def pick_next_training_context(self) -> Optional[TrainingContext]:
+    def pick_next_training_context(self) -> TrainingContext | None:
         states: list[RolloutContextState] = []
         seen: dict[str, TrainingContext] = {}
         for queue in self.pending_by_context.values():
             if not queue:
                 continue
-            context = queue[0][0]
-            seen[context.key] = context
+            request = queue[0]
+            seen[request.context.key] = request.context
         for context in seen.values():
             if len(self.active_tasks) >= self.max_concurrent_groups:
                 break
@@ -116,7 +118,15 @@ class AsyncRollouter:
             states.append(state)
         return self.rollout_policy.pick_next_context(states)
 
-    async def run_one_group(self, context: TrainingContext, sample: SampleRecord) -> PartitionMetadata:
+    def _should_protect(self, request: RolloutGroupRequest) -> bool:
+        """Return True if this request has been aborted too many times and must not be aborted again."""
+        if not self.partial_rollout_config.enabled:
+            return False
+        return request.abort_count >= self.partial_rollout_config.max_aborted_count
+
+    async def run_one_group(self, request: RolloutGroupRequest) -> RolloutGroupResult:
+        context = request.context
+        sample = request.sample
         tool_manager = self.tool_manager_factory.create(sample, context)
         trajectory = sample.get('trajectory') or sample
         self.adapter_registry.on_rollout_started(context)
@@ -124,10 +134,28 @@ class AsyncRollouter:
             rollout_kwargs = {'tool_manager': tool_manager, 'adapter_name': context.adapter_name}
             if context.adapter_revision is not None:
                 rollout_kwargs['adapter_path'] = context.adapter_revision
+            # Pass partial_state to rollout if resuming an aborted request
+            if request.is_resumed and self.partial_rollout_config.enabled:
+                rollout_kwargs['partial_state'] = request.partial_state
             result = self.rollout([trajectory], **rollout_kwargs)
             if asyncio.iscoroutine(result):
                 result = await result
-            trajectories = list(result)
+
+            # Rollout may signal an abort by returning a RolloutGroupResult directly
+            if isinstance(result, RolloutGroupResult):
+                if result.status == 'aborted' and self.partial_rollout_config.enabled:
+                    record = self.adapter_registry.get(context)
+                    record.abort_count += 1
+                    return RolloutGroupResult(
+                        request=request,
+                        status='aborted',
+                        partial_state=result.partial_state,
+                        error=result.error,
+                    )
+                trajectories = result.trajectories
+            else:
+                trajectories = list(result)
+
             partition_id = self._select_or_create_partition(context)
             meta = self.data_plane.put_rollout_batch(
                 context,
@@ -139,7 +167,9 @@ class AsyncRollouter:
             self.adapter_registry.on_partition_created(context, partition_id)
             self._last_submit_time[context.key] = time.time()
             self._submitted_groups[context.key] += 1
-            return meta
+            return RolloutGroupResult(request=request, trajectories=trajectories, status='ok', partition_meta=meta)
+        except Exception as exc:
+            return RolloutGroupResult(request=request, status='failed', error=str(exc))
         finally:
             self.adapter_registry.on_rollout_finished(context)
 
@@ -150,18 +180,31 @@ class AsyncRollouter:
         meta = self.data_plane.create_partition(context, target_groups=self.target_groups_per_partition)
         return meta.partition_id
 
-    async def step(self) -> Optional[PartitionMetadata]:
+    async def step(self) -> RolloutGroupResult | None:
         context = self.pick_next_training_context()
         if context is None:
             return None
         queue = self.pending_by_context[context.key]
-        _, sample = queue.popleft()
-        return await self.run_one_group(context, sample)
+        request = queue.popleft()
+        result = await self.run_one_group(request)
+        if result.status == 'aborted' and self.partial_rollout_config.enabled:
+            # Recycle aborted request: update abort_count, set protected flag, push back to front
+            recycled = RolloutGroupRequest(
+                context=request.context,
+                sample=request.sample,
+                partial_state=result.partial_state,
+                abort_count=request.abort_count + 1,
+                protected=self._should_protect(
+                    RolloutGroupRequest(
+                        context=request.context, sample=request.sample, abort_count=request.abort_count + 1)),
+            )
+            queue.appendleft(recycled)
+        return result
 
 
 class RewardWorker:
 
-    def __init__(self, *, data_plane: TransferQueueDataPlane, reward_registry: Dict[str, Callable[..., List[float]]]):
+    def __init__(self, *, data_plane: TransferQueueDataPlane, reward_registry: dict[str, Callable[..., list[float]]]):
         self.data_plane = data_plane
         self.reward_registry = reward_registry
 
@@ -181,13 +224,13 @@ class AdvantageWorker:
         self,
         *,
         data_plane: TransferQueueDataPlane,
-        advantage_fn: Optional[Callable[[List[SampleRecord], TrainingContext], tuple[list[float], list[float]]]] = None,
+        advantage_fn: Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]] | None = None,
     ):
         self.data_plane = data_plane
         self.advantage_fn = advantage_fn or self._default_advantage_fn
 
     @staticmethod
-    def _default_advantage_fn(samples: List[SampleRecord], context: TrainingContext) -> tuple[list[float], list[float]]:
+    def _default_advantage_fn(samples: list[SampleRecord], context: TrainingContext) -> tuple[list[float], list[float]]:
         rewards = [float(sample.get('rewards', sample.get('reward', 0.0))) for sample in samples]
         if not rewards:
             return [], []
@@ -203,15 +246,15 @@ class AdvantageWorker:
 
 class TrainerScheduler:
 
-    def __init__(self, *, adapter_registry: AdapterRegistry, train_policy: Optional[Any] = None):
+    def __init__(self, *, adapter_registry: AdapterRegistry, train_policy: Any | None = None):
         self.adapter_registry = adapter_registry
         self.train_policy = train_policy or PreferCurrentTrainPolicy()
 
     def next_partition(
         self,
-        candidates: List[PartitionMetadata],
-        current_context: Optional[TrainingContext] = None,
-    ) -> Optional[PartitionMetadata]:
+        candidates: list[PartitionMetadata],
+        current_context: TrainingContext | None = None,
+    ) -> PartitionMetadata | None:
         filtered = []
         for partition in candidates:
             if partition.status != PartitionStatus.TRAIN_READY:
@@ -224,8 +267,8 @@ class TrainerScheduler:
 
 @dataclass
 class TrainerStepResult:
-    adapter_revision: Optional[str] = None
-    metrics: Optional[Dict[str, Any]] = None
+    adapter_revision: str | None = None
+    metrics: dict[str, Any] | None = None
 
 
 class TrainerWorker:
@@ -236,17 +279,17 @@ class TrainerWorker:
         data_plane: TransferQueueDataPlane,
         adapter_registry: AdapterRegistry,
         scheduler: TrainerScheduler,
-        train_partition_fn: Callable[[TrainingContext, str, Any], TrainerStepResult | Dict[str, Any] | None],
-        receive_weights_fn: Optional[Callable[[TrainingContext], None]] = None,
+        train_partition_fn: Callable[[TrainingContext, str, Any], TrainerStepResult | dict[str, Any] | None],
+        receive_weights_fn: Callable[[TrainingContext], None] | None = None,
     ):
         self.data_plane = data_plane
         self.adapter_registry = adapter_registry
         self.scheduler = scheduler
         self.train_partition_fn = train_partition_fn
         self.receive_weights_fn = receive_weights_fn
-        self.current_context: Optional[TrainingContext] = None
+        self.current_context: TrainingContext | None = None
 
-    def run_once(self) -> Optional[PartitionMetadata]:
+    def run_once(self) -> PartitionMetadata | None:
         partition = self.scheduler.next_partition(
             self.data_plane.list_train_ready_partitions(),
             self.current_context,

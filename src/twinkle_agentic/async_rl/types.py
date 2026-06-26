@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Dict, List, Optional, Tuple
 
+from twinkle.data_format import Trajectory
+
 
 class PartitionStatus(StrEnum):
     OPEN = 'OPEN'
@@ -33,7 +35,7 @@ class TrainingContext:
     training_run_id: str
     base_model_id: str
     adapter_name: str
-    adapter_revision: Optional[str] = None
+    adapter_revision: str | None = None
     policy_version: int = 0
     env_type: str = 'tool_calling'
     tool_profile: str = 'default'
@@ -49,7 +51,7 @@ class TrainingContext:
         suffix = train_id if isinstance(train_id, str) and train_id.startswith('train_') else f'train_{train_id}'
         return f'{self.key}/{suffix}'
 
-    def with_policy_version(self, policy_version: int, adapter_revision: Optional[str] = None) -> 'TrainingContext':
+    def with_policy_version(self, policy_version: int, adapter_revision: str | None = None) -> TrainingContext:
         return TrainingContext(
             tenant_id=self.tenant_id,
             training_run_id=self.training_run_id,
@@ -64,7 +66,7 @@ class TrainingContext:
             algorithm=self.algorithm,
         )
 
-    def metadata(self) -> Dict[str, Any]:
+    def metadata(self) -> dict[str, Any]:
         return {
             'tenant_id': self.tenant_id,
             'training_run_id': self.training_run_id,
@@ -79,7 +81,7 @@ class TrainingContext:
             'algorithm': self.algorithm,
         }
 
-    def validate_metadata(self, metadata: Dict[str, Any], *, strict_policy_version: bool = True) -> None:
+    def validate_metadata(self, metadata: dict[str, Any], *, strict_policy_version: bool = True) -> None:
         expected = self.metadata()
         for key, expected_value in expected.items():
             if key == 'adapter_revision':
@@ -102,8 +104,8 @@ class PartitionMetadata:
     status: PartitionStatus = PartitionStatus.OPEN
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
-    owner_worker_id: Optional[str] = None
-    lease_deadline: Optional[float] = None
+    owner_worker_id: str | None = None
+    lease_deadline: float | None = None
     num_rows: int = 0
 
     @property
@@ -113,7 +115,7 @@ class PartitionMetadata:
     def touch(self) -> None:
         self.updated_at = time.time()
 
-    def tag(self) -> Dict[str, Any]:
+    def tag(self) -> dict[str, Any]:
         tag = self.context.metadata()
         tag.update({
             'partition_id': self.partition_id,
@@ -134,16 +136,17 @@ class AdapterRecord:
     base_model_id: str
     state: AdapterState = AdapterState.LOADING
     policy_version: int = 0
-    adapter_revision: Optional[str] = None
-    train_slot_name: Optional[str] = None
-    rollout_slot_name: Optional[str] = None
+    adapter_revision: str | None = None
+    train_slot_name: str | None = None
+    rollout_slot_name: str | None = None
     live_partitions: set[str] = field(default_factory=set)
     in_flight_rollouts: int = 0
-    training_partition: Optional[str] = None
+    training_partition: str | None = None
     sync_in_progress: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
-    last_error: Optional[str] = None
+    last_error: str | None = None
+    abort_count: int = 0
     weight: float = 1.0
 
     @property
@@ -189,3 +192,42 @@ RewardFn = Any
 AdvantageFn = Any
 TrainResult = Dict[str, Any]
 ContextKey = Tuple[str, str, str]
+
+
+@dataclass
+class PartialRolloutConfig:
+    """Controls interrupt-and-resume behavior for in-flight rollouts."""
+    enabled: bool = False
+    max_aborted_count: int = 3
+    mask_offpolicy_tokens: bool = True
+
+
+@dataclass
+class RolloutGroupRequest:
+    """A unit of rollout work that can be aborted and resumed.
+
+    `partial_state` carries already-generated tokens/messages when a request
+    is recycled after an abort. `abort_count` tracks how many times this
+    request has been interrupted; once it reaches the configured limit the
+    request becomes `protected` and will not be aborted again (anti-starvation).
+    """
+    context: TrainingContext
+    sample: SampleRecord
+    partial_state: dict[str, Any] | None = None
+    abort_count: int = 0
+    protected: bool = False
+
+    @property
+    def is_resumed(self) -> bool:
+        return self.partial_state is not None
+
+
+@dataclass
+class RolloutGroupResult:
+    """Outcome of run_one_group; `status` distinguishes completion from abort."""
+    request: RolloutGroupRequest
+    trajectories: list[Trajectory] = field(default_factory=list)
+    status: str = 'ok'  # ok / aborted / failed
+    partition_meta: PartitionMetadata | None = None
+    partial_state: dict[str, Any] | None = None
+    error: str | None = None

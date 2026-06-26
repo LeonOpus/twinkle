@@ -211,8 +211,10 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
         max_concurrent_groups=1,
     )
     rollouter.add_pending(context, [make_sample(0)])
-    meta = asyncio.run(rollouter.step())
-    assert meta is not None
+    result = asyncio.run(rollouter.step())
+    assert result is not None
+    assert result.status == 'ok'
+    meta = result.partition_meta
     assert meta.status == PartitionStatus.ROLLOUT_DONE
 
     RewardWorker(data_plane=data_plane, reward_registry={'constant': lambda trajectories, **_: [1.0]}).run_once(context)
@@ -238,3 +240,125 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
     assert received[0].adapter_revision == '/tmp/adapter-lora-v1'
     assert data_plane.list_partitions(context)[0].status == PartitionStatus.CLEARED
     assert registry.get(context).live_partitions == set()
+
+
+# ---------------------------------------------------------------------------
+# Partial rollout tests
+# ---------------------------------------------------------------------------
+
+def test_partial_rollout_aborted_request_recycled_to_queue_front():
+    """Aborted request is pushed back to the front of the queue with updated abort_count."""
+    from twinkle_agentic.async_rl import PartialRolloutConfig, RolloutGroupResult
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = AdapterRegistry()
+    registry.register(context)
+
+    abort_calls = []
+
+    class AbortOnceRollout:
+        def __call__(self, trajectories, **kwargs):
+            abort_calls.append(len(abort_calls))
+            if len(abort_calls) == 1:
+                # Signal abort on first call
+                from twinkle_agentic.async_rl.types import RolloutGroupRequest as Req
+                dummy_req = Req(context=context, sample=trajectories[0])
+                return RolloutGroupResult(
+                    request=dummy_req,
+                    status='aborted',
+                    partial_state={'tokens': [1, 2, 3]},
+                )
+            # Second call succeeds
+            return [dict(t) for t in trajectories]
+
+    cfg = PartialRolloutConfig(enabled=True, max_aborted_count=3)
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        adapter_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=2, target_groups_per_partition=1),
+        rollout=AbortOnceRollout(),
+        partial_rollout_config=cfg,
+        max_concurrent_groups=4,
+    )
+    rollouter.add_pending(context, [make_sample(0)])
+
+    # First step: rollout aborts → result status aborted, request recycled
+    result1 = asyncio.run(rollouter.step())
+    assert result1.status == 'aborted'
+    queue = rollouter.pending_by_context[context.key]
+    assert len(queue) == 1, "aborted request should be back in queue"
+    recycled = queue[0]
+    assert recycled.abort_count == 1
+    assert recycled.partial_state == {'tokens': [1, 2, 3]}
+    assert recycled.is_resumed
+
+    # Second step: rollout succeeds with partial_state passed in
+    result2 = asyncio.run(rollouter.step())
+    assert result2.status == 'ok'
+    assert len(abort_calls) == 2
+
+
+def test_partial_rollout_protected_after_max_aborts():
+    """Request becomes protected once abort_count reaches max_aborted_count."""
+    from twinkle_agentic.async_rl import PartialRolloutConfig
+    from twinkle_agentic.async_rl.types import RolloutGroupRequest, RolloutGroupResult as RGR
+
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = AdapterRegistry()
+    registry.register(context)
+
+    class AlwaysAbortRollout:
+        def __call__(self, trajectories, **kwargs):
+            dummy_req = RolloutGroupRequest(context=context, sample=trajectories[0])
+            return RGR(request=dummy_req, status='aborted', partial_state={'tokens': []})
+
+    cfg = PartialRolloutConfig(enabled=True, max_aborted_count=2)
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        adapter_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=5, target_groups_per_partition=1),
+        rollout=AlwaysAbortRollout(),
+        partial_rollout_config=cfg,
+        max_concurrent_groups=4,
+    )
+    rollouter.add_pending(context, [make_sample(0)])
+
+    # Abort twice → abort_count reaches max_aborted_count → protected=True
+    asyncio.run(rollouter.step())  # abort_count → 1
+    asyncio.run(rollouter.step())  # abort_count → 2
+
+    queue = rollouter.pending_by_context[context.key]
+    assert len(queue) == 1
+    req = queue[0]
+    assert req.abort_count == 2
+    assert req.protected is True
+
+
+def test_partial_rollout_disabled_by_default():
+    """When PartialRolloutConfig.enabled=False (default), aborted result is NOT recycled."""
+    from twinkle_agentic.async_rl.types import RolloutGroupRequest, RolloutGroupResult as RGR
+
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = AdapterRegistry()
+    registry.register(context)
+
+    class AbortRollout:
+        def __call__(self, trajectories, **kwargs):
+            dummy_req = RolloutGroupRequest(context=context, sample=trajectories[0])
+            return RGR(request=dummy_req, status='aborted', partial_state={'tokens': []})
+
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        adapter_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=2, target_groups_per_partition=1),
+        rollout=AbortRollout(),
+        # partial_rollout_config not set → disabled by default
+        max_concurrent_groups=4,
+    )
+    rollouter.add_pending(context, [make_sample(0)])
+    result = asyncio.run(rollouter.step())
+    # When disabled, aborted result passes through but queue stays empty (no recycle)
+    queue = rollouter.pending_by_context[context.key]
+    assert len(queue) == 0, "disabled: aborted request must NOT be recycled"
